@@ -1,558 +1,303 @@
+// dictionary api url
 const API_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/";
-const FAVORITES_KEY = "wordly-favorites";
-const CACHE_KEY_PREFIX = "wordly-definition:";
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const SEARCH_TIMEOUT_MS = 8000;
-const AUDIO_START_TIMEOUT_MS = 1500;
 
+// storage key for saved words and theme
+const STORAGE_KEY = "wordly-favorites";
+const THEME_KEY = "wordly-theme";
+
+// grab the elements
 const form = document.getElementById("search-form");
 const input = document.getElementById("word-input");
-const searchButton = document.getElementById("search-button");
 const results = document.getElementById("results");
-const statusMessage = document.getElementById("search-status");
 const errorBox = document.getElementById("error-message");
 const favoritesList = document.getElementById("favorites-list");
 const themeToggle = document.getElementById("theme-toggle");
 
-let favorites = [];
-let activeRequest;
+// load saved words from storage, or start with an empty list
+let favorites = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
 
-const showError = (message, retryWord) => {
-  errorBox.replaceChildren();
-  errorBox.appendChild(document.createTextNode(message));
-  if (retryWord) {
-    const retryButton = document.createElement("button");
-    retryButton.type = "button";
-    retryButton.className = "retry-button";
-    retryButton.textContent = "Retry search";
-    retryButton.setAttribute("aria-label", `Retry search for ${retryWord}`);
-    retryButton.addEventListener("click", () => handleSearch(retryWord));
-    errorBox.appendChild(retryButton);
-  }
+// show an error message on screen
+function showError(message) {
+  errorBox.textContent = message;
   errorBox.classList.remove("hidden");
-};
+}
 
-const clearError = () => {
-  errorBox.replaceChildren();
+// hide the error message
+function clearError() {
+  errorBox.textContent = "";
   errorBox.classList.add("hidden");
-};
+}
 
-const setLoading = (isLoading, message) => {
-  searchButton.disabled = isLoading;
-  form.setAttribute("aria-busy", String(isLoading));
-  results.setAttribute("aria-busy", String(isLoading));
-  if (message) statusMessage.textContent = message;
-};
-
-const loadFavorites = () => {
-  try {
-    const stored = localStorage.getItem(FAVORITES_KEY);
-    const parsed = stored ? JSON.parse(stored) : [];
-    if (
-      !Array.isArray(parsed) ||
-      parsed.some((word) => typeof word !== "string")
-    ) {
-      throw new Error("Saved words have an invalid format.");
-    }
-    favorites = [...new Set(parsed.map((word) => word.toLowerCase()))];
-  } catch (error) {
-    showError(
-      error instanceof SyntaxError
-        ? "Saved words could not be read. Clear this site's saved data and try again."
-        : "Saved words are unavailable in this browser."
-    );
+// use the browser's built-in voice to say a word
+function speakWord(word) {
+  if (!window.speechSynthesis) {
+    showError("Audio not supported in this browser.");
+    return;
   }
-};
+  window.speechSynthesis.cancel();
+  const speech = new SpeechSynthesisUtterance(word);
+  speech.lang = "en-US";
+  window.speechSynthesis.speak(speech);
+}
 
-const fetchWord = async (word, signal) => {
+// fetch word data from the api
+async function fetchWord(word) {
+  const url = API_URL + encodeURIComponent(word);
+
   let response;
   try {
-    response = await fetch(`${API_URL}${encodeURIComponent(word)}`, { signal });
-  } catch (error) {
-    if (error.name === "AbortError") throw error;
-    throw new Error(
-      "Could not connect to the dictionary. Check your internet connection."
-    );
+    response = await fetch(url);
+  } catch (err) {
+    throw new Error("Could not connect. Check your internet.");
   }
 
   if (response.status === 404) {
     throw new Error(
-      `No definition found for "${word}". Check the spelling and try again.`
+      'No definition found for "' + word + '". Check the spelling.'
     );
   }
+
+  // server-side errors - api is down or overloaded
+  if (response.status >= 500) {
+    throw new Error(
+      "The dictionary service is unavailable right now (error " +
+        response.status +
+        "). Please try again in a few minutes."
+    );
+  }
+
   if (!response.ok) {
-    throw new Error(
-      `The dictionary request failed (error ${response.status}). Please try again.`
-    );
+    throw new Error("Request failed with status " + response.status);
   }
 
-  let data;
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error(
-      "The dictionary returned an unreadable response. Please try again."
-    );
+  const data = await response.json();
+
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("No usable data returned for that word.");
   }
-  if (!Array.isArray(data) || !data.length || !data[0]?.word) {
-    throw new Error(
-      "The dictionary returned no usable information for that word."
-    );
-  }
+
   return data;
-};
+}
 
-const getCachedWord = (word) => {
-  const key = `${CACHE_KEY_PREFIX}${word.toLowerCase()}`;
-  try {
-    const cached = localStorage.getItem(key);
-    if (!cached) return undefined;
+// build the word card
+function renderWord(data) {
+  results.innerHTML = "";
+  const entry = data[0];
 
-    const { data, cachedAt } = JSON.parse(cached);
-    if (
-      !Array.isArray(data) ||
-      !data.length ||
-      !data[0]?.word ||
-      !Number.isFinite(cachedAt) ||
-      Date.now() - cachedAt > CACHE_TTL_MS
-    ) {
-      localStorage.removeItem(key);
-      return undefined;
+  const card = document.createElement("div");
+  card.className = "word-card";
+
+  // header with word, phonetic, and buttons
+  const header = document.createElement("div");
+  header.className = "word-header";
+
+  const title = document.createElement("h2");
+  title.textContent = entry.word;
+  header.appendChild(title);
+
+  // phonetic - try top level first, then look inside phonetics array
+  let phoneticText = entry.phonetic;
+  if (!phoneticText && entry.phonetics) {
+    for (let i = 0; i < entry.phonetics.length; i++) {
+      if (entry.phonetics[i].text) {
+        phoneticText = entry.phonetics[i].text;
+        break;
+      }
     }
-    return data;
-  } catch (error) {
-    console.warn("Could not read cached dictionary entry.", error);
-    return undefined;
   }
-};
-
-const cacheWord = (word, data) => {
-  try {
-    localStorage.setItem(
-      `${CACHE_KEY_PREFIX}${word.toLowerCase()}`,
-      JSON.stringify({ data, cachedAt: Date.now() })
-    );
-  } catch (error) {
-    console.warn("Could not cache dictionary entry.", error);
+  const phonetic = document.createElement("span");
+  phonetic.className = "phonetic";
+  if (phoneticText) {
+    phonetic.textContent = phoneticText;
   }
-};
+  else {
+    phonetic.textContent = "Pronunciation unavailable";
+  }
+  header.appendChild(phonetic);
 
-const createElement = (tag, className, text) => {
-  const element = document.createElement(tag);
-  if (className) element.className = className;
-  if (text !== undefined) element.textContent = text;
-  return element;
-};
+  // play audio button
+  const audioBtn = document.createElement("button");
+  audioBtn.type = "button";
+  audioBtn.className = "audio-btn";
+  audioBtn.textContent = "Play Audio";
+  audioBtn.addEventListener("click", function () {
+    speakWord(entry.word);
+  });
+  header.appendChild(audioBtn);
 
-const uniqueWords = (words) => [
-  ...new Set(
-    words
-      .filter(Boolean)
-      .map((word) => word.trim())
-      .filter(Boolean)
-  ),
-];
-
-const speakWord = (word) => () => {
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(word);
-  utterance.lang = "en-US";
-  window.speechSynthesis.speak(utterance);
-};
-
-const canSpeakWord = () =>
-  "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
-
-const createSpeechFallback = (word) => {
-  if (canSpeakWord()) {
-    const speakButton = createElement("button", "audio-btn", "Speak word");
-    speakButton.type = "button";
-    speakButton.setAttribute("aria-label", `Speak ${word}`);
-    speakButton.addEventListener("click", speakWord(word));
-    return speakButton;
+  // save button
+  const isSaved = favorites.indexOf(entry.word) !== -1;
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "save-btn";
+  if (isSaved) {
+    saveBtn.classList.add("saved");
+    saveBtn.textContent = "Saved";
+  }
+  else {
+    saveBtn.textContent = "Save";
   }
 
-  return createElement(
-    "p",
-    "pronunciation-unavailable",
-    "Audio pronunciation unavailable."
-  );
-};
-
-const addPronunciationControl = (actions, word, pronunciation) => {
-  const status = createElement("span", "audio-status");
-  status.setAttribute("role", "status");
-  status.setAttribute("aria-live", "polite");
-
-  if (!pronunciation) {
-    actions.appendChild(createSpeechFallback(word));
-    return;
-  }
-
-  const audio = createElement("audio", "pronunciation-audio");
-  audio.preload = "none";
-  audio.src = pronunciation.startsWith("//")
-    ? `https:${pronunciation}`
-    : pronunciation;
-  audio.setAttribute("aria-label", `Pronunciation audio for ${word}`);
-
-  const playButton = createElement("button", "audio-btn", "Play audio");
-  playButton.type = "button";
-  playButton.setAttribute("aria-label", `Play pronunciation for ${word}`);
-  let speechFallback = false;
-  let speechUnavailable = false;
-
-  const useSpeechFallback = (message) => {
-    if (canSpeakWord()) {
-      speechFallback = true;
-      playButton.textContent = "Speak instead";
-      playButton.setAttribute("aria-label", `Speak ${word}`);
+  saveBtn.addEventListener("click", function () {
+    toggleFavorite(entry.word);
+    if (favorites.indexOf(entry.word) !== -1) {
+      saveBtn.classList.add("saved");
+      saveBtn.textContent = "Saved";
     }
     else {
-      speechUnavailable = true;
-      playButton.disabled = true;
-      playButton.textContent = "Audio unavailable";
-      status.textContent = message;
-    }
-  };
-
-  audio.addEventListener("error", () => {
-    useSpeechFallback("Audio could not be loaded. Try again later.");
-  });
-  audio.addEventListener("ended", () => {
-    if (!speechFallback) {
-      playButton.disabled = false;
-      playButton.textContent = "Play audio";
-      status.textContent = "";
+      saveBtn.classList.remove("saved");
+      saveBtn.textContent = "Save";
     }
   });
-  playButton.addEventListener("click", async () => {
-    if (speechFallback) {
-      speakWord(word)();
-      status.textContent = "Playing pronunciation with speech synthesis.";
-      return;
-    }
-    if (speechUnavailable) {
-      return;
-    }
+  header.appendChild(saveBtn);
 
-    playButton.disabled = true;
-    playButton.setAttribute("aria-busy", "true");
-    status.textContent = "Loading pronunciation audio...";
-    let timeoutId;
-    let audioStarted = false;
-    try {
-      const playback = Promise.resolve(audio.play()).then(
-        () => true,
-        () => false
-      );
-      const startTimeout = new Promise((resolve) => {
-        timeoutId = window.setTimeout(
-          () => resolve(false),
-          AUDIO_START_TIMEOUT_MS
-        );
-      });
-      audioStarted = await Promise.race([playback, startTimeout]);
-    } catch {
-      audioStarted = false;
-    } finally {
-      window.clearTimeout(timeoutId);
-      playButton.disabled = false;
-      playButton.removeAttribute("aria-busy");
-    }
-
-    if (audioStarted && !speechFallback) {
-      playButton.textContent = "Playing...";
-      status.textContent = "Playing pronunciation.";
-      return;
-    }
-
-    audio.pause();
-    useSpeechFallback(
-      "Audio did not start quickly. Trying speech pronunciation instead."
-    );
-    if (canSpeakWord()) {
-      speakWord(word)();
-      status.textContent =
-        "Audio was slow; playing pronunciation with speech synthesis.";
-    }
-    else if (!speechUnavailable) {
-      status.textContent =
-        "Audio playback failed. Try again when audio is available.";
-    }
-  });
-
-  actions.appendChild(playButton);
-  actions.appendChild(audio);
-  actions.appendChild(status);
-};
-
-const renderWord = (data) => {
-  const entry = data[0];
-  const card = createElement("article", "word-card");
-  const header = createElement("div", "word-header");
-  const titleGroup = createElement("div", "word-title-group");
-  const title = createElement("h2", "", entry.word);
-  const phoneticText =
-    entry.phonetic || entry.phonetics?.find((phonetic) => phonetic.text)?.text;
-  titleGroup.appendChild(title);
-  titleGroup.appendChild(
-    createElement("p", "phonetic", phoneticText || "Pronunciation unavailable")
-  );
-  header.appendChild(titleGroup);
-
-  const actions = createElement("div", "word-actions");
-  const pronunciation = entry.phonetics?.find(
-    (phonetic) => phonetic.audio
-  )?.audio;
-  addPronunciationControl(actions, entry.word, pronunciation);
-
-  const saved = favorites.includes(entry.word.toLowerCase());
-  const saveButton = createElement(
-    "button",
-    `save-btn${saved ? " saved" : ""}`,
-    saved ? "Remove" : "Save word"
-  );
-  saveButton.type = "button";
-  saveButton.setAttribute("aria-pressed", String(saved));
-  saveButton.setAttribute(
-    "aria-label",
-    saved ? `Remove ${entry.word} from saved words` : `Save ${entry.word}`
-  );
-  saveButton.addEventListener("click", () => {
-    const isSaved = toggleFavorite(entry.word);
-    if (isSaved === null) return;
-    saveButton.classList.toggle("saved", isSaved);
-    saveButton.textContent = isSaved ? "Remove" : "Save word";
-    saveButton.setAttribute("aria-pressed", String(isSaved));
-    saveButton.setAttribute(
-      "aria-label",
-      isSaved ? `Remove ${entry.word} from saved words` : `Save ${entry.word}`
-    );
-  });
-  actions.appendChild(saveButton);
-  header.appendChild(actions);
   card.appendChild(header);
 
+  // meanings - one block per part of speech
   const meanings = entry.meanings || [];
-  const hasDefinitions = meanings.some(
-    (meaning) => meaning.definitions?.length
-  );
-  if (!hasDefinitions) {
-    card.appendChild(
-      createElement("p", "definition-unavailable", "No definitions available.")
-    );
-  }
+  for (let m = 0; m < meanings.length; m++) {
+    const meaning = meanings[m];
 
-  for (const meaning of meanings) {
-    const block = createElement("section", "meaning");
-    block.appendChild(
-      createElement("h3", "", meaning.partOfSpeech || "Definition")
-    );
+    const block = document.createElement("div");
+    block.className = "meaning";
 
-    for (const definition of meaning.definitions || []) {
-      const item = createElement("div", "definition-item");
-      item.appendChild(createElement("p", "definition", definition.definition));
-      if (definition.example) {
-        item.appendChild(
-          createElement("p", "example", `“${definition.example}”`)
-        );
+    const pos = document.createElement("h3");
+    pos.textContent = meaning.partOfSpeech || "Definition";
+    block.appendChild(pos);
+
+    // definitions
+    const defs = meaning.definitions || [];
+    for (let d = 0; d < defs.length; d++) {
+      const def = defs[d];
+
+      const p = document.createElement("p");
+      p.className = "definition";
+      p.textContent = def.definition;
+      block.appendChild(p);
+
+      if (def.example) {
+        const ex = document.createElement("p");
+        ex.className = "example";
+        ex.textContent = '"' + def.example + '"';
+        block.appendChild(ex);
       }
-      block.appendChild(item);
     }
 
-    const synonyms = uniqueWords([
-      ...(meaning.synonyms || []),
-      ...(meaning.definitions || []).flatMap(
-        (definition) => definition.synonyms || []
-      ),
-    ]);
-    const antonyms = uniqueWords([
-      ...(meaning.antonyms || []),
-      ...(meaning.definitions || []).flatMap(
-        (definition) => definition.antonyms || []
-      ),
-    ]);
-    block.appendChild(
-      createElement(
-        "p",
-        "synonyms",
-        synonyms.length
-          ? `Synonyms: ${synonyms.join(", ")}`
-          : "No synonyms available."
-      )
-    );
-    block.appendChild(
-      createElement(
-        "p",
-        "antonyms",
-        antonyms.length
-          ? `Antonyms: ${antonyms.join(", ")}`
-          : "No antonyms available."
-      )
-    );
+    // synonyms with fallback
+    const synonyms = meaning.synonyms || [];
+    const syn = document.createElement("p");
+    syn.className = "synonyms";
+    if (synonyms.length > 0) {
+      syn.textContent = "Synonyms: " + synonyms.join(", ");
+    }
+    else {
+      syn.textContent = "No synonyms available.";
+    }
+    block.appendChild(syn);
+
+    // antonyms with fallback
+    const antonyms = meaning.antonyms || [];
+    const ant = document.createElement("p");
+    ant.className = "antonyms";
+    if (antonyms.length > 0) {
+      ant.textContent = "Antonyms: " + antonyms.join(", ");
+    }
+    else {
+      ant.textContent = "No antonyms available.";
+    }
+    block.appendChild(ant);
+
     card.appendChild(block);
   }
 
-  if (entry.origin) {
-    const origin = createElement("p", "origin");
-    origin.appendChild(createElement("strong", "", "Origin: "));
-    origin.appendChild(document.createTextNode(entry.origin));
-    card.appendChild(origin);
+  results.appendChild(card);
+}
+
+// add or remove a word from saved list
+function toggleFavorite(word) {
+  const index = favorites.indexOf(word);
+
+  if (index !== -1) {
+    favorites.splice(index, 1);
+  }
+  else {
+    favorites.push(word);
   }
 
-  const sourceUrls = uniqueWords(entry.sourceUrls || []);
-  if (sourceUrls.length) {
-    const source = createElement("p", "source");
-    source.appendChild(document.createTextNode("Source: "));
-    sourceUrls.forEach((url, index) => {
-      if (!URL.canParse(url)) return;
-      const parsedUrl = new URL(url);
-      if (!["http:", "https:"].includes(parsedUrl.protocol)) return;
-      if (index) source.appendChild(document.createTextNode(", "));
-      const link = createElement("a", "", parsedUrl.hostname);
-      link.href = parsedUrl.href;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      source.appendChild(link);
-    });
-    if (source.childNodes.length > 1) card.appendChild(source);
-  }
-
-  results.replaceChildren(card);
-};
-
-const toggleFavorite = (word) => {
-  const normalizedWord = word.toLowerCase();
-  const nextFavorites = favorites.includes(normalizedWord)
-    ? favorites.filter((favorite) => favorite !== normalizedWord)
-    : [...favorites, normalizedWord];
-
-  try {
-    localStorage.setItem(FAVORITES_KEY, JSON.stringify(nextFavorites));
-  } catch {
-    showError(
-      "Your browser could not save this word. Check its storage settings and try again."
-    );
-    return null;
-  }
-
-  favorites = nextFavorites;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(favorites));
   renderFavorites();
-  return favorites.includes(normalizedWord);
-};
+}
 
-const renderFavorites = () => {
-  favoritesList.replaceChildren();
-  if (!favorites.length) {
-    favoritesList.appendChild(
-      createElement("li", "empty-favorites", "No saved words yet")
-    );
+// redraw the saved words list
+function renderFavorites() {
+  favoritesList.innerHTML = "";
+
+  if (favorites.length === 0) {
+    const empty = document.createElement("li");
+    empty.textContent = "No saved words yet";
+    empty.className = "empty-favorites";
+    favoritesList.appendChild(empty);
     return;
   }
 
-  favorites.forEach((word) => {
-    const item = createElement("li");
-    const button = createElement("button", "favorite-word", word);
+  for (let i = 0; i < favorites.length; i++) {
+    const word = favorites[i];
+
+    const li = document.createElement("li");
+
+    // button gets the styled class
+    const button = document.createElement("button");
     button.type = "button";
-    button.addEventListener("click", () => {
+    button.className = "favorite-word";
+    button.textContent = word;
+    button.addEventListener("click", function () {
       input.value = word;
       handleSearch(word);
     });
-    item.appendChild(button);
-    favoritesList.appendChild(item);
-  });
-};
 
-const handleSearch = async (rawWord) => {
-  const word = rawWord.trim();
-  const cachedData = word ? getCachedWord(word) : undefined;
+    li.appendChild(button);
+    favoritesList.appendChild(li);
+  }
+}
+
+// main search handler
+async function handleSearch(word) {
   clearError();
-  statusMessage.textContent = "";
-  if (cachedData) {
-    renderWord(cachedData);
-  }
-  else {
-    results.replaceChildren();
-  }
+  results.innerHTML = "";
 
-  if (!word) {
-    activeRequest?.abort();
-    activeRequest = undefined;
-    setLoading(false);
-    statusMessage.textContent = "";
+  if (!word || word.trim() === "") {
     showError("Please enter a word to search.");
     input.focus();
     return;
   }
 
-  activeRequest?.abort();
-  const controller = new AbortController();
-  activeRequest = controller;
-  const requestTimeout = window.setTimeout(
-    () => controller.abort(),
-    SEARCH_TIMEOUT_MS
-  );
-  setLoading(
-    !cachedData,
-    cachedData
-      ? `Showing saved definition for ${cachedData[0].word}; checking for updates...`
-      : "Searching the dictionary..."
-  );
-
   try {
-    const data = await fetchWord(word, controller.signal);
-    cacheWord(word, data);
+    const data = await fetchWord(word.trim());
     renderWord(data);
-    statusMessage.textContent = cachedData
-      ? `Definitions for ${data[0].word} updated.`
-      : `Definitions for ${data[0].word}.`;
-  } catch (error) {
-    if (error.name === "AbortError" && activeRequest === controller) {
-      showError(
-        cachedData
-          ? `The update took too long. Showing the saved definition for "${cachedData[0].word}".`
-          : "The dictionary request took too long. Check your connection and try again.",
-        word
-      );
-      statusMessage.textContent = cachedData
-        ? `Showing saved definition for ${cachedData[0].word}.`
-        : "Search unsuccessful.";
-    }
-    else if (error.name !== "AbortError") {
-      showError(
-        cachedData
-          ? `${error.message} Showing the saved definition for "${cachedData[0].word}".`
-          : error.message,
-        word
-      );
-      statusMessage.textContent = cachedData
-        ? `Showing saved definition for ${cachedData[0].word}.`
-        : "Search unsuccessful.";
-    }
-  } finally {
-    window.clearTimeout(requestTimeout);
-    if (activeRequest === controller) {
-      activeRequest = undefined;
-      setLoading(false);
-    }
+  } catch (err) {
+    showError(err.message);
   }
-};
+}
 
-form.addEventListener("submit", (event) => {
-  event.preventDefault();
+// form submit
+form.addEventListener("submit", function (e) {
+  e.preventDefault();
   handleSearch(input.value);
 });
 
-themeToggle.addEventListener("click", () => {
-  const isDark = document.body.classList.toggle("dark");
+// dark mode toggle
+themeToggle.addEventListener("click", function () {
+  document.body.classList.toggle("dark");
+  const isDark = document.body.classList.contains("dark");
   themeToggle.textContent = isDark ? "Light Mode" : "Dark Mode";
-  themeToggle.setAttribute("aria-pressed", String(isDark));
+  localStorage.setItem(THEME_KEY, isDark ? "dark" : "light");
 });
 
-loadFavorites();
-renderFavorites();
+// restore saved theme on page load
+if (localStorage.getItem(THEME_KEY) === "dark") {
+  document.body.classList.add("dark");
+  themeToggle.textContent = "Light Mode";
+}
 
-window.addEventListener("unhandledrejection", (e) =>
-  console.log("REJECTION:", e.reason)
-);
+// start
+renderFavorites();
